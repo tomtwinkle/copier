@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"unicode"
 )
 
 // These flags define options for tag handling
@@ -28,9 +29,13 @@ const (
 type Option struct {
 	// setting this value to true will ignore copying zero values of all the fields, including bools, as well as a
 	// struct having all it's fields set to their zero values respectively (see IsZero() in reflect/value.go)
-	IgnoreEmpty bool
-	DeepCopy    bool
+	IgnoreEmpty   bool
+	DeepCopy      bool
+	IgnorePrivate bool
+	HookFunc      *HookFunc
 }
+
+type HookFunc func(value reflect.Value, field reflect.StructField) bool
 
 // Copy copy things
 func Copy(toValue interface{}, fromValue interface{}) (err error) {
@@ -190,7 +195,9 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 					continue
 				}
 
-				if fromField := source.FieldByName(name); fromField.IsValid() && !shouldIgnore(fromField, opt.IgnoreEmpty) {
+				if fromField := source.FieldByName(name); fromField.IsValid() &&
+					!shouldIgnore(fromField, field, opt.IgnoreEmpty, opt.IgnorePrivate) &&
+					hook(fromField, field, opt.HookFunc) {
 					// process for nested anonymous field
 					destFieldNotSet := false
 					if f, ok := dest.Type().FieldByName(name); ok {
@@ -263,7 +270,9 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 					fromMethod = source.MethodByName(name)
 				}
 
-				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 && !shouldIgnore(fromMethod, opt.IgnoreEmpty) {
+				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 &&
+					!shouldIgnore(fromMethod, field, opt.IgnoreEmpty, opt.IgnorePrivate) &&
+					hook(fromMethod, field, opt.HookFunc) {
 					if toField := dest.FieldByName(name); toField.IsValid() && toField.CanSet() {
 						values := fromMethod.Call([]reflect.Value{})
 						if len(values) >= 1 {
@@ -290,12 +299,21 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 	return
 }
 
-func shouldIgnore(v reflect.Value, ignoreEmpty bool) bool {
-	if !ignoreEmpty {
-		return false
+func shouldIgnore(v reflect.Value, field reflect.StructField, ignoreEmpty, ignorePrivate bool) bool {
+	if ignoreEmpty {
+		return v.IsZero()
 	}
+	if ignorePrivate {
+		return unicode.IsLower([]rune(field.Name)[0])
+	}
+	return false
+}
 
-	return v.IsZero()
+func hook(v reflect.Value, field reflect.StructField, f *HookFunc) bool {
+	if f == nil {
+		return true
+	}
+	return (*f)(v, field)
 }
 
 func deepFields(reflectType reflect.Type) []reflect.StructField {
