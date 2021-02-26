@@ -1,8 +1,6 @@
 # Copier
 
-  I am a copier, I copy everything from one to another
-
-[![test status](https://github.com/jinzhu/copier/workflows/tests/badge.svg?branch=master "test status")](https://github.com/jinzhu/copier/actions)
+  This is a function-added version of the original [copier](https://github.com/jinzhu/copier).
 
 ## Features
 
@@ -23,16 +21,21 @@ package main
 
 import (
 	"fmt"
-	"github.com/jinzhu/copier"
+	"github.com/tomtwinkle/copier"
 )
 
 type User struct {
-	Name string
-	Role string
-	Age  int32
+	Name      string
+	Role      string
+	Age       int32
+	SkillSets string
+
+	// Tell copier.Copy to coping this field as the set `reference to the dest field tag`.
+	// must be start Upper case(public field).
+	Message  string `copier:"CommentField"`
 
 	// Explicitly ignored in the destination struct.
-	Salary   int
+	Salary    int
 }
 
 func (user *User) DoubleAge() int32 {
@@ -51,6 +54,14 @@ type Employee struct {
 	// Tell copier.Copy to explicitly ignore copying this field.
 	Salary    int    `copier:"-"`
 
+	// Tell copier.Copy to coping this field as the set `SkillSets`.
+	// must be start Upper case(public field).
+    Skill     string `copier:"SkillSet"`
+
+	// Tell copier.Copy to coping this field as the set `reference to the src field tag`.
+	// must be start Upper case(public field).
+	Comment   string `copier:"CommentField"`
+
 	DoubleAge int32
 	EmployeId int64
 	SuperRole string
@@ -62,8 +73,8 @@ func (employee *Employee) Role(role string) {
 
 func main() {
 	var (
-		user      = User{Name: "Jinzhu", Age: 18, Role: "Admin", Salary: 200000}
-		users     = []User{{Name: "Jinzhu", Age: 18, Role: "Admin", Salary: 100000}, {Name: "jinzhu 2", Age: 30, Role: "Dev", Salary: 60000}}
+		user      = User{Name: "tomtwinkle", Age: 18, Role: "Admin", Salary: 200000, SkillSets:"golang", Message: "test!"}
+		users     = []User{{Name: "tomtwinkle", Age: 18, Role: "Admin", Salary: 100000}, {Name: "tomtwinkle 2", Age: 30, Role: "Dev", Salary: 60000}}
 		employee  = Employee{Salary: 150000}
 		employees = []Employee{}
 	)
@@ -72,9 +83,11 @@ func main() {
 
 	fmt.Printf("%#v \n", employee)
 	// Employee{
-	//    Name: "Jinzhu",           // Copy from field
+	//    Name: "tomtwinkle",       // Copy from field
 	//    Age: 18,                  // Copy from field
 	//    Salary:150000,            // Copying explicitly ignored
+	//    Skill:"golang",           // Copying from field
+	//    Comment:"test!",          // Copying from field
 	//    DoubleAge: 36,            // Copy from method
 	//    EmployeeId: 0,            // Ignored
 	//    SuperRole: "Super Admin", // Copy to method
@@ -85,7 +98,7 @@ func main() {
 
 	fmt.Printf("%#v \n", employees)
 	// []Employee{
-	//   {Name: "Jinzhu", Age: 18, Salary:0, DoubleAge: 36, EmployeId: 0, SuperRole: "Super Admin"}
+	//   {Name: "tomtwinkle", Age: 18, Salary:0, DoubleAge: 36, EmployeId: 0, SuperRole: "Super Admin"}
 	// }
 
 	// Copy slice to slice
@@ -94,8 +107,8 @@ func main() {
 
 	fmt.Printf("%#v \n", employees)
 	// []Employee{
-	//   {Name: "Jinzhu", Age: 18, Salary:0, DoubleAge: 36, EmployeId: 0, SuperRole: "Super Admin"},
-	//   {Name: "jinzhu 2", Age: 30, Salary:0, DoubleAge: 60, EmployeId: 0, SuperRole: "Super Dev"},
+	//   {Name: "tomtwinkle", Age: 18, Salary:0, DoubleAge: 36, EmployeId: 0, SuperRole: "Super Admin"},
+	//   {Name: "tomtwinkle 2", Age: 30, Salary:0, DoubleAge: 60, EmployeId: 0, SuperRole: "Super Dev"},
 	// }
 
  	// Copy map to map
@@ -114,18 +127,10 @@ func main() {
 copier.CopyWithOption(&to, &from, copier.Option{IgnoreEmpty: true, DeepCopy: true})
 ```
 
-## Contributing
-
-You can help to make the project better, check out [http://gorm.io/contribute.html](http://gorm.io/contribute.html) for things you can do.
-
 # Author
 
-**jinzhu**
-
-* <http://github.com/jinzhu>
-* <wosmvp@gmail.com>
-* <http://twitter.com/zhangjinzhu>
+**tomtwinkle**
 
 ## License
 
-Released under the [MIT License](https://github.com/jinzhu/copier/blob/master/License).
+Released under the [MIT License](https://github.com/tomtwinkle/copier/blob/master/License).
