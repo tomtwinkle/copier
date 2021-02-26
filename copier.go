@@ -3,6 +3,7 @@ package copier
 import (
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -34,10 +35,22 @@ type Option struct {
 	IgnorePrivate bool
 	HookFunc      []HookFunc
 	ParseFunc     []ParseFunc
+
+	// private
+	destNames TagNameMap
+	srcNames  TagNameMap
 }
 
-type HookFunc func(value reflect.Value, field reflect.StructField) bool
-type ParseFunc func(src, dst reflect.Value) bool
+type TagNameMap struct {
+	FieldNameToTag map[string]string
+	TagToFieldName map[string]string
+}
+
+// proceed true: proceed, false: do not continue copy processing
+type HookFunc func(value reflect.Value, field reflect.StructField) (proceed bool)
+
+// copied true: do not continue copy processing
+type ParseFunc func(to, from reflect.Value) (copied bool, err error)
 
 // Copy copy things
 func Copy(toValue interface{}, fromValue interface{}) (err error) {
@@ -51,10 +64,8 @@ func CopyWithOption(toValue interface{}, fromValue interface{}, opt Option) (err
 
 func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) {
 	var (
-		isSlice bool
-		amount  = 1
-		from    = indirect(reflect.ValueOf(fromValue))
-		to      = indirect(reflect.ValueOf(toValue))
+		from = indirect(reflect.ValueOf(fromValue))
+		to   = indirect(reflect.ValueOf(toValue))
 	)
 
 	if !to.CanAddr() {
@@ -66,7 +77,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 		return ErrInvalidCopyFrom
 	}
 
-	fromType, isPtrFrom := indirectType(from.Type())
+	fromType, _ := indirectType(from.Type())
 	toType, _ := indirectType(to.Type())
 
 	if fromType.Kind() == reflect.Interface {
@@ -82,77 +93,146 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 		from.Kind() != reflect.Struct &&
 		from.Kind() != reflect.Map &&
 		(from.Type().AssignableTo(to.Type()) || from.Type().ConvertibleTo(to.Type())) {
-		// custom parse func
-		for _, f := range opt.ParseFunc {
-			if f(from, to) {
-				return
-			}
-		}
-		if !isPtrFrom || !opt.DeepCopy {
-			to.Set(from.Convert(to.Type()))
-		} else {
-			fromCopy := reflect.New(from.Type())
-			fromCopy.Set(from.Elem())
-			to.Set(fromCopy.Convert(to.Type()))
-		}
-		return
+		return copyNormalType(to, from, opt)
 	}
 
 	if fromType.Kind() == reflect.Map && toType.Kind() == reflect.Map {
-		if !fromType.Key().ConvertibleTo(toType.Key()) {
-			return ErrMapKeyNotMatch
-		}
-
-		if to.IsNil() {
-			to.Set(reflect.MakeMapWithSize(toType, from.Len()))
-		}
-
-		for _, k := range from.MapKeys() {
-			toKey := indirect(reflect.New(toType.Key()))
-			if !set(toKey, k, opt.DeepCopy, opt.ParseFunc) {
-				return fmt.Errorf("%w map, old key: %v, new key: %v", ErrNotSupported, k.Type(), toType.Key())
-			}
-
-			elemType, _ := indirectType(toType.Elem())
-			toValue := indirect(reflect.New(elemType))
-			if !set(toValue, from.MapIndex(k), opt.DeepCopy, opt.ParseFunc) {
-				if err = copier(toValue.Addr().Interface(), from.MapIndex(k).Interface(), opt); err != nil {
-					return err
-				}
-			}
-
-			for {
-				if elemType == toType.Elem() {
-					to.SetMapIndex(toKey, toValue)
-					break
-				}
-				elemType = reflect.PtrTo(elemType)
-				toValue = toValue.Addr()
-			}
-		}
-		return
+		return copyMapType(to, from, toType, fromType, opt)
 	}
 
 	if from.Kind() == reflect.Slice && to.Kind() == reflect.Slice && fromType.ConvertibleTo(toType) {
-		if to.IsNil() {
-			slice := reflect.MakeSlice(reflect.SliceOf(to.Type().Elem()), from.Len(), from.Cap())
-			to.Set(slice)
-		}
-		for i := 0; i < from.Len(); i++ {
-			if !set(to.Index(i), from.Index(i), opt.DeepCopy, opt.ParseFunc) {
-				err = CopyWithOption(to.Index(i).Addr().Interface(), from.Index(i).Interface(), opt)
-				if err != nil {
-					continue
-				}
-			}
-		}
-		return
+		return copySliceType(to, from, opt)
 	}
 
 	if fromType.Kind() != reflect.Struct || toType.Kind() != reflect.Struct {
 		// skip not supported type
 		return
 	}
+
+	return copyStructType(to, from, toType, fromType, opt)
+}
+
+func shouldIgnore(v reflect.Value, field reflect.StructField, ignoreEmpty, ignorePrivate bool) bool {
+	if ignoreEmpty {
+		return v.IsZero()
+	}
+	if ignorePrivate {
+		return unicode.IsLower([]rune(field.Name)[0])
+	}
+	return false
+}
+
+func hookFunc(v reflect.Value, field reflect.StructField, funcs []HookFunc) bool {
+	for _, f := range funcs {
+		if !f(v, field) {
+			return false
+		}
+	}
+	return true
+}
+
+func copyNormalType(to, from reflect.Value, opt Option) error {
+	// custom parse func
+	for _, f := range opt.ParseFunc {
+		if proceed, err := f(to, from); err != nil {
+			return err
+		} else {
+			if !proceed {
+				return nil
+			}
+		}
+	}
+	var isPtrFrom bool
+	for from.Type().Kind() == reflect.Ptr || from.Type().Kind() == reflect.Slice {
+		isPtrFrom = true
+	}
+	if !isPtrFrom || !opt.DeepCopy {
+		to.Set(from.Convert(to.Type()))
+	} else {
+		fromCopy := reflect.New(from.Type())
+		fromCopy.Set(from.Elem())
+		to.Set(fromCopy.Convert(to.Type()))
+	}
+	return nil
+}
+
+func copyMapType(to, from reflect.Value, toType, fromType reflect.Type, opt Option) error {
+	// custom parse func
+	for _, f := range opt.ParseFunc {
+		if proceed, err := f(to, from); err != nil {
+			return err
+		} else {
+			if !proceed {
+				return nil
+			}
+		}
+	}
+
+	if !fromType.Key().ConvertibleTo(toType.Key()) {
+		return ErrMapKeyNotMatch
+	}
+
+	if to.IsNil() {
+		to.Set(reflect.MakeMapWithSize(toType, from.Len()))
+	}
+
+	for _, k := range from.MapKeys() {
+		toKey := indirect(reflect.New(toType.Key()))
+		if !set(toKey, k, opt.DeepCopy, opt.ParseFunc) {
+			return fmt.Errorf("%w map, old key: %v, new key: %v", ErrNotSupported, k.Type(), toType.Key())
+		}
+
+		elemType, _ := indirectType(toType.Elem())
+		toValue := indirect(reflect.New(elemType))
+		if !set(toValue, from.MapIndex(k), opt.DeepCopy, opt.ParseFunc) {
+			if err := copier(toValue.Addr().Interface(), from.MapIndex(k).Interface(), opt); err != nil {
+				return err
+			}
+		}
+
+		for {
+			if elemType == toType.Elem() {
+				to.SetMapIndex(toKey, toValue)
+				break
+			}
+			elemType = reflect.PtrTo(elemType)
+			toValue = toValue.Addr()
+		}
+	}
+	return nil
+}
+
+func copySliceType(to, from reflect.Value, opt Option) error {
+	// custom parse func
+	for _, f := range opt.ParseFunc {
+		if proceed, err := f(to, from); err != nil {
+			return err
+		} else {
+			if !proceed {
+				return nil
+			}
+		}
+	}
+	if to.IsNil() {
+		slice := reflect.MakeSlice(reflect.SliceOf(to.Type().Elem()), from.Len(), from.Cap())
+		to.Set(slice)
+	}
+	for i := 0; i < from.Len(); i++ {
+		if !set(to.Index(i), from.Index(i), opt.DeepCopy, opt.ParseFunc) {
+			err := CopyWithOption(to.Index(i).Addr().Interface(), from.Index(i).Interface(), opt)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func copyStructType(to, from reflect.Value, toType, fromType reflect.Type, opt Option) error {
+	var (
+		isSlice bool
+		amount  = 1
+	)
 
 	if to.Kind() == reflect.Slice {
 		isSlice = true
@@ -188,109 +268,46 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 		// Get tag options
 		tagBitFlags := map[string]uint8{}
 		if dest.IsValid() {
-			tagBitFlags = getBitFlags(toType)
+			var err error
+			if tagBitFlags, err = getBitFlags(toType); err != nil {
+				return err
+			}
+			if opt.destNames, err = getNameFlag(toType); err != nil {
+				return err
+			}
 		}
 
 		// check source
 		if source.IsValid() {
-			// Copy from source field to dest field or method
-			fromTypeFields := deepFields(fromType)
-			for _, field := range fromTypeFields {
-				name := field.Name
-
-				// Get bit flags for field
-				fieldFlags, _ := tagBitFlags[name]
-
-				// Check if we should ignore copying
-				if (fieldFlags & tagIgnore) != 0 {
-					continue
+			// custom parse func
+			var proceed bool
+			for _, f := range opt.ParseFunc {
+				var err error
+				if proceed, err = f(dest, source); err != nil {
+					return err
 				}
+				if !proceed {
+					break
+				}
+			}
+			if proceed {
+				continue
+			}
 
-				if fromField := source.FieldByName(name); fromField.IsValid() &&
-					!shouldIgnore(fromField, field, opt.IgnoreEmpty, opt.IgnorePrivate) &&
-					hookFunc(fromField, field, opt.HookFunc) {
-					// process for nested anonymous field
-					destFieldNotSet := false
-					if f, ok := dest.Type().FieldByName(name); ok {
-						for idx, x := range f.Index {
-							if x >= dest.NumField() {
-								continue
-							}
-
-							destFieldKind := dest.Field(x).Kind()
-							if destFieldKind != reflect.Ptr {
-								continue
-							}
-
-							if !dest.Field(x).IsNil() {
-								continue
-							}
-
-							if !dest.Field(x).CanSet() {
-								destFieldNotSet = true
-								break
-							}
-
-							newValue := reflect.New(dest.FieldByIndex(f.Index[0 : idx+1]).Type().Elem())
-							dest.Field(x).Set(newValue)
-						}
-					}
-
-					if destFieldNotSet {
-						break
-					}
-
-					toField := dest.FieldByName(name)
-					if toField.IsValid() {
-						if toField.CanSet() {
-							if !set(toField, fromField, opt.DeepCopy, opt.ParseFunc) {
-								if err := copier(toField.Addr().Interface(), fromField.Interface(), opt); err != nil {
-									return err
-								}
-							} else {
-								if fieldFlags != 0 {
-									// Note that a copy was made
-									tagBitFlags[name] = fieldFlags | hasCopied
-								}
-							}
-						}
-					} else {
-						// try to set to method
-						var toMethod reflect.Value
-						if dest.CanAddr() {
-							toMethod = dest.Addr().MethodByName(name)
-						} else {
-							toMethod = dest.MethodByName(name)
-						}
-
-						if toMethod.IsValid() && toMethod.Type().NumIn() == 1 && fromField.Type().AssignableTo(toMethod.Type().In(0)) {
-							toMethod.Call([]reflect.Value{fromField})
-						}
-					}
+			var err error
+			if opt.srcNames, err = getNameFlag(fromType); err != nil {
+				return err
+			}
+			// Copy from source field to dest field or method
+			for _, field := range deepFields(fromType) {
+				if err := copyStructFromDest(source, dest, field, tagBitFlags, opt); err != nil {
+					return err
 				}
 			}
 
 			// Copy from from method to dest field
 			for _, field := range deepFields(toType) {
-				name := field.Name
-
-				var fromMethod reflect.Value
-				if source.CanAddr() {
-					fromMethod = source.Addr().MethodByName(name)
-				} else {
-					fromMethod = source.MethodByName(name)
-				}
-
-				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 &&
-					!shouldIgnore(fromMethod, field, opt.IgnoreEmpty, opt.IgnorePrivate) &&
-					hookFunc(fromMethod, field, opt.HookFunc) {
-					if toField := dest.FieldByName(name); toField.IsValid() && toField.CanSet() {
-						values := fromMethod.Call([]reflect.Value{})
-						if len(values) >= 1 {
-							set(toField, values[0], opt.DeepCopy, opt.ParseFunc)
-						}
-					}
-				}
+				copyStructFromSrcMethod(source, dest, field, opt)
 			}
 		}
 
@@ -303,30 +320,143 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 		} else if initDest {
 			to.Set(dest)
 		}
-
-		err = checkBitFlags(tagBitFlags)
-	}
-
-	return
-}
-
-func shouldIgnore(v reflect.Value, field reflect.StructField, ignoreEmpty, ignorePrivate bool) bool {
-	if ignoreEmpty {
-		return v.IsZero()
-	}
-	if ignorePrivate {
-		return unicode.IsLower([]rune(field.Name)[0])
-	}
-	return false
-}
-
-func hookFunc(v reflect.Value, field reflect.StructField, funcs []HookFunc) bool {
-	for _, f := range funcs {
-		if !f(v, field) {
-			return false
+		if err := checkBitFlags(tagBitFlags); err != nil {
+			return err
 		}
 	}
-	return true
+	return nil
+}
+
+func copyStructFromDest(source, dest reflect.Value, field reflect.StructField, tagBitFlags map[string]uint8, opt Option) error {
+	var (
+		srcName  = field.Name
+		destName = field.Name
+	)
+
+	// get tags field name
+	if srcTagName, ok := opt.srcNames.FieldNameToTag[srcName]; ok {
+		destName = srcTagName
+	}
+	if destTagName, ok := opt.destNames.TagToFieldName[destName]; ok {
+		destName = destTagName
+	}
+
+	// Get bit flags for field
+	fieldFlags, _ := tagBitFlags[destName]
+
+	// Check if we should ignore copying
+	if (fieldFlags & tagIgnore) != 0 {
+		return nil
+	}
+
+	fromField := source.FieldByName(srcName)
+	if !fromField.IsValid() {
+		return nil
+	}
+	if shouldIgnore(fromField, field, opt.IgnoreEmpty, opt.IgnorePrivate) {
+		return nil
+	}
+	if !hookFunc(fromField, field, opt.HookFunc) {
+		return nil
+	}
+
+	// process for nested anonymous field
+	destFieldNotSet := false
+	if dest.Type().Kind() != reflect.Struct {
+		return nil
+	}
+	if f, ok := dest.Type().FieldByName(destName); ok {
+		for idx, x := range f.Index {
+			if x >= dest.NumField() {
+				continue
+			}
+
+			destFieldKind := dest.Field(x).Kind()
+			if destFieldKind != reflect.Ptr {
+				continue
+			}
+
+			if !dest.Field(x).IsNil() {
+				continue
+			}
+
+			if !dest.Field(x).CanSet() {
+				destFieldNotSet = true
+				break
+			}
+
+			newValue := reflect.New(dest.FieldByIndex(f.Index[0 : idx+1]).Type().Elem())
+			dest.Field(x).Set(newValue)
+		}
+	}
+
+	if destFieldNotSet {
+		return nil
+	}
+
+	toField := dest.FieldByName(destName)
+	if toField.IsValid() {
+		if toField.CanSet() {
+			if !set(toField, fromField, opt.DeepCopy, opt.ParseFunc) {
+				if err := copier(toField.Addr().Interface(), fromField.Interface(), opt); err != nil {
+					return err
+				}
+			} else {
+				if fieldFlags != 0 {
+					// Note that a copy was made
+					tagBitFlags[destName] = fieldFlags | hasCopied
+				}
+			}
+		}
+	} else {
+		// try to set to method
+		var toMethod reflect.Value
+		if dest.CanAddr() {
+			toMethod = dest.Addr().MethodByName(destName)
+		} else {
+			toMethod = dest.MethodByName(destName)
+		}
+
+		if toMethod.IsValid() && toMethod.Type().NumIn() == 1 && fromField.Type().AssignableTo(toMethod.Type().In(0)) {
+			toMethod.Call([]reflect.Value{fromField})
+		}
+	}
+	return nil
+}
+
+func copyStructFromSrcMethod(source, dest reflect.Value, field reflect.StructField, opt Option) {
+	var (
+		srcName  = field.Name
+		destName = field.Name
+	)
+
+	if destTagName, ok := opt.destNames.FieldNameToTag[destName]; ok {
+		srcName = destTagName
+	}
+	if srcFieldName, ok := opt.srcNames.TagToFieldName[srcName]; ok {
+		srcName = srcFieldName
+	}
+
+	var fromMethod reflect.Value
+	if source.CanAddr() {
+		fromMethod = source.Addr().MethodByName(srcName)
+	} else {
+		fromMethod = source.MethodByName(srcName)
+	}
+
+	if dest.Kind() != reflect.Struct {
+		return
+	}
+	if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 &&
+		!shouldIgnore(fromMethod, field, opt.IgnoreEmpty, opt.IgnorePrivate) &&
+		hookFunc(fromMethod, field, opt.HookFunc) {
+		if toField := dest.FieldByName(destName); toField.IsValid() && toField.CanSet() {
+			values := fromMethod.Call([]reflect.Value{})
+			if len(values) >= 1 {
+				set(toField, values[0], opt.DeepCopy, opt.ParseFunc)
+			}
+		}
+	}
 }
 
 func deepFields(reflectType reflect.Type) []reflect.StructField {
@@ -392,8 +522,12 @@ func set(to, from reflect.Value, deepCopy bool, funcs []ParseFunc) bool {
 
 		// custom parse func
 		for _, f := range funcs {
-			if f(from, to) {
+			if proceed, err := f(to, from); err != nil {
 				return true
+			} else {
+				if !proceed {
+					return true
+				}
 			}
 		}
 
@@ -454,7 +588,7 @@ func set(to, from reflect.Value, deepCopy bool, funcs []ParseFunc) bool {
 }
 
 // parseTags Parses struct tags and returns uint8 bit flags.
-func parseTags(tag string) (flags uint8) {
+func parseTags(tag string) (flags uint8, name string, err error) {
 	for _, t := range strings.Split(tag, ",") {
 		switch t {
 		case "-":
@@ -464,13 +598,19 @@ func parseTags(tag string) (flags uint8) {
 			flags = flags | tagMust
 		case "nopanic":
 			flags = flags | tagNoPanic
+		default:
+			if unicode.IsUpper([]rune(t)[0]) {
+				name = strings.TrimSpace(t)
+			} else {
+				err = errors.New("copier field name tag must be start Upper case")
+			}
 		}
 	}
 	return
 }
 
 // getBitFlags Parses struct tags for bit flags.
-func getBitFlags(toType reflect.Type) map[string]uint8 {
+func getBitFlags(toType reflect.Type) (map[string]uint8, error) {
 	flags := map[string]uint8{}
 	toTypeFields := deepFields(toType)
 
@@ -478,10 +618,36 @@ func getBitFlags(toType reflect.Type) map[string]uint8 {
 	for _, field := range toTypeFields {
 		tags := field.Tag.Get("copier")
 		if tags != "" {
-			flags[field.Name] = parseTags(tags)
+			var err error
+			if flags[field.Name], _, err = parseTags(tags); err != nil {
+				return flags, err
+			}
 		}
 	}
-	return flags
+	return flags, nil
+}
+
+// getNameFlag Parses struct tags for name flags.
+func getNameFlag(toType reflect.Type) (TagNameMap, error) {
+	flags := TagNameMap{
+		FieldNameToTag: map[string]string{},
+		TagToFieldName: map[string]string{},
+	}
+	toTypeFields := deepFields(toType)
+
+	// Get a list dest of tags
+	for _, field := range toTypeFields {
+		tags := field.Tag.Get("copier")
+		if tags != "" {
+			if _, name, err := parseTags(tags); err != nil {
+				return flags, err
+			} else if name != "" {
+				flags.FieldNameToTag[field.Name] = name
+				flags.TagToFieldName[name] = field.Name
+			}
+		}
+	}
+	return flags, nil
 }
 
 // checkBitFlags Checks flags for error or panic conditions.
