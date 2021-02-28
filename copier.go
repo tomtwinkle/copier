@@ -114,13 +114,13 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 
 		for _, k := range from.MapKeys() {
 			toKey := indirect(reflect.New(toType.Key()))
-			if !set(toKey, k, opt.DeepCopy) {
+			if !set(toKey, k, opt) {
 				return fmt.Errorf("%w map, old key: %v, new key: %v", ErrNotSupported, k.Type(), toType.Key())
 			}
 
 			elemType, _ := indirectType(toType.Elem())
 			toValue := indirect(reflect.New(elemType))
-			if !set(toValue, from.MapIndex(k), opt.DeepCopy) {
+			if !set(toValue, from.MapIndex(k), opt) {
 				if err = copier(toValue.Addr().Interface(), from.MapIndex(k).Interface(), opt); err != nil {
 					return err
 				}
@@ -144,7 +144,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 			to.Set(slice)
 		}
 		for i := 0; i < from.Len(); i++ {
-			if !set(to.Index(i), from.Index(i), opt.DeepCopy) {
+			if !set(to.Index(i), from.Index(i), opt) {
 				err = CopyWithOption(to.Index(i).Addr().Interface(), from.Index(i).Interface(), opt)
 				if err != nil {
 					continue
@@ -247,7 +247,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 					toField := dest.FieldByName(destFieldName)
 					if toField.IsValid() {
 						if toField.CanSet() {
-							if !set(toField, fromField, opt.DeepCopy) {
+							if !set(toField, fromField, opt) {
 								if err := copier(toField.Addr().Interface(), fromField.Interface(), opt); err != nil {
 									return err
 								}
@@ -289,7 +289,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 					if toField := dest.FieldByName(destFieldName); toField.IsValid() && toField.CanSet() {
 						values := fromMethod.Call([]reflect.Value{})
 						if len(values) >= 1 {
-							set(toField, values[0], opt.DeepCopy)
+							set(toField, values[0], opt)
 						}
 					}
 				}
@@ -354,7 +354,15 @@ func indirectType(reflectType reflect.Type) (_ reflect.Type, isPtr bool) {
 	return reflectType, isPtr
 }
 
-func set(to, from reflect.Value, deepCopy bool) bool {
+func set(to, from reflect.Value, opt Option) bool {
+	if from.IsValid() && from.IsValid() {
+		if ok, err := parseFunc(to, from, opt); err != nil {
+			return false
+		} else if ok {
+			return true
+		}
+	}
+
 	if from.IsValid() {
 		if to.Kind() == reflect.Ptr {
 			// set `to` to nil if from is nil
@@ -381,7 +389,7 @@ func set(to, from reflect.Value, deepCopy bool) bool {
 			to = to.Elem()
 		}
 
-		if deepCopy {
+		if opt.DeepCopy {
 			toKind := to.Kind()
 			if toKind == reflect.Interface && to.IsNil() {
 				to.Set(reflect.New(reflect.TypeOf(from.Interface())).Elem())
@@ -428,7 +436,7 @@ func set(to, from reflect.Value, deepCopy bool) bool {
 				to.Set(rv)
 			}
 		} else if from.Kind() == reflect.Ptr {
-			return set(to, from.Elem(), deepCopy)
+			return set(to, from.Elem(), opt)
 		} else {
 			return false
 		}
@@ -565,17 +573,7 @@ func getFieldName(fieldName string, flags Flags) (srcFieldName string, destField
 	return
 }
 
-func hookFunc(v reflect.Value, field reflect.StructField, funcs []HookFunc) bool {
-	for _, f := range funcs {
-		if !f(v, field) {
-			return false
-		}
-	}
-	return true
-}
-
-func parseFunc(to, from reflect.Value, opt Option) (bool, error) {
-	var copied bool
+func parseFunc(to, from reflect.Value, opt Option) (copied bool, err error) {
 	for _, f := range opt.ParseFunc {
 		var err error
 		if copied, err = f(to, from); err != nil {
