@@ -32,7 +32,6 @@ type Option struct {
 	// struct having all it's fields set to their zero values respectively (see IsZero() in reflect/value.go)
 	IgnoreEmpty bool
 	DeepCopy    bool
-	HookFunc    []HookFunc
 	ParseFunc   []ParseFunc
 }
 
@@ -46,9 +45,6 @@ type TagNameMapping struct {
 	FieldNameToTag map[string]string
 	TagToFieldName map[string]string
 }
-
-// proceed true: proceed, false: do not continue copy processing
-type HookFunc func(value reflect.Value, field reflect.StructField) (proceed bool)
 
 // copied true: do not continue copy processing
 type ParseFunc func(to, from reflect.Value) (copied bool, err error)
@@ -575,7 +571,7 @@ func getFieldName(fieldName string, flags Flags) (srcFieldName string, destField
 
 func parseFunc(to, from reflect.Value, opt Option) (copied bool, err error) {
 	for _, f := range opt.ParseFunc {
-		var err error
+		copied = false
 		if copied, err = f(to, from); err != nil {
 			return false, err
 		}
