@@ -134,12 +134,17 @@ func (c copierData) copier(toValue interface{}, fromValue interface{}, opt Optio
 	fromType, isPtrFrom := indirectType(from.Type())
 	toType, _ := indirectType(to.Type())
 
-	if fromType.Kind() == reflect.Interface && from.Interface() != nil {
+	if fromType.Kind() == reflect.Interface {
 		fromType = reflect.TypeOf(from.Interface())
 	}
 
-	if toType.Kind() == reflect.Interface && to.Interface() != nil {
-		toType = reflect.TypeOf(to.Interface())
+	if toType.Kind() == reflect.Interface {
+		toType, _ = indirectType(reflect.TypeOf(to.Interface()))
+		oldTo := to
+		to = reflect.New(reflect.TypeOf(to.Interface())).Elem()
+		defer func() {
+			oldTo.Set(to)
+		}()
 	}
 
 	// Just set it if possible to assign for normal types
@@ -194,7 +199,12 @@ func (c copierData) copier(toValue interface{}, fromValue interface{}, opt Optio
 			slice := reflect.MakeSlice(reflect.SliceOf(to.Type().Elem()), from.Len(), from.Cap())
 			to.Set(slice)
 		}
+
 		for i := 0; i < from.Len(); i++ {
+			if to.Len() < i+1 {
+				to.Set(reflect.Append(to, reflect.New(to.Type().Elem()).Elem()))
+			}
+
 			if !c.set(to.Index(i), from.Index(i), opt) {
 				err = CopyWithOption(to.Index(i).Addr().Interface(), from.Index(i).Interface(), opt)
 				if err != nil {
@@ -345,9 +355,17 @@ func (c copierData) copier(toValue interface{}, fromValue interface{}, opt Optio
 
 		if isSlice {
 			if dest.Addr().Type().AssignableTo(to.Type().Elem()) {
-				to.Set(reflect.Append(to, dest.Addr()))
+				if to.Len() < i+1 {
+					to.Set(reflect.Append(to, dest.Addr()))
+				} else {
+					c.set(to.Index(i), dest.Addr(), opt)
+				}
 			} else if dest.Type().AssignableTo(to.Type().Elem()) {
-				to.Set(reflect.Append(to, dest))
+				if to.Len() < i+1 {
+					to.Set(reflect.Append(to, dest))
+				} else {
+					c.set(to.Index(i), dest, opt)
+				}
 			}
 		} else if initDest {
 			to.Set(dest)
