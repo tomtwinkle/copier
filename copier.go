@@ -134,11 +134,11 @@ func (c copierData) copier(toValue interface{}, fromValue interface{}, opt Optio
 	fromType, isPtrFrom := indirectType(from.Type())
 	toType, _ := indirectType(to.Type())
 
-	if fromType.Kind() == reflect.Interface {
+	if fromType.Kind() == reflect.Interface && from.Interface() != nil {
 		fromType = reflect.TypeOf(from.Interface())
 	}
 
-	if toType.Kind() == reflect.Interface {
+	if toType.Kind() == reflect.Interface && to.Interface() != nil {
 		toType = reflect.TypeOf(to.Interface())
 	}
 
