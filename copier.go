@@ -138,7 +138,7 @@ func (c copierData) copier(toValue interface{}, fromValue interface{}, opt Optio
 		fromType = reflect.TypeOf(from.Interface())
 	}
 
-	if toType.Kind() == reflect.Interface {
+	if toType.Kind() == reflect.Interface && to.Interface() != nil {
 		toType, _ = indirectType(reflect.TypeOf(to.Interface()))
 		oldTo := to
 		to = reflect.New(reflect.TypeOf(to.Interface())).Elem()
