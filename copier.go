@@ -3,9 +3,12 @@ package copier
 import (
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
+	"github.com/golang/groupcache/lru"
 	"reflect"
 	"strings"
+	"unicode"
 )
 
 // These flags define options for tag handling
@@ -32,17 +35,86 @@ type Option struct {
 	DeepCopy    bool
 }
 
+type Flags struct {
+	BitFlags  map[string]uint8
+	SrcNames  TagNameMapping
+	DestNames TagNameMapping
+}
+
+type TagNameMapping struct {
+	FieldNameToTag map[string]string
+	TagToFieldName map[string]string
+}
+
+type TypePair struct {
+	SrcType reflect.Type
+	DstType reflect.Type
+}
+
+type TypedCopier interface {
+	Copy(dstValue, srcValue reflect.Value) error
+	Pairs() []TypePair
+}
+
+type HookFunc func(dstValue, srcValue reflect.Value) (proceed bool)
+
+type Copier interface {
+	Copy(toValue interface{}, fromValue interface{}) (err error)
+	CopyWithOption(toValue interface{}, fromValue interface{}, opt Option) (err error)
+	Register(copiers ...TypedCopier)
+	HookFunc(hookFunc HookFunc)
+}
+
+type copierData struct {
+	typeCache *lru.Cache
+	flags     Flags
+	hookFunc HookFunc
+}
+
+func NewCopier() Copier {
+	return &copierData{
+		typeCache:   lru.New(1000),
+		hookFunc: func(dstValue, srcValue reflect.Value) (proceed bool) {
+			return true
+		},
+	}
+}
+
 // Copy copy things
 func Copy(toValue interface{}, fromValue interface{}) (err error) {
-	return copier(toValue, fromValue, Option{})
+	c := NewCopier()
+	return c.Copy(toValue, fromValue)
+}
+
+func CopyWithOption(toValue interface{}, fromValue interface{}, opt Option) (err error) {
+	c := NewCopier()
+	return c.CopyWithOption(toValue, fromValue, opt)
+}
+
+// Copy copy things
+func (c copierData) Copy(toValue interface{}, fromValue interface{}) (err error) {
+	return c.copier(toValue, fromValue, Option{})
 }
 
 // CopyWithOption copy with option
-func CopyWithOption(toValue interface{}, fromValue interface{}, opt Option) (err error) {
-	return copier(toValue, fromValue, opt)
+func (c copierData) CopyWithOption(toValue interface{}, fromValue interface{}, opt Option) (err error) {
+	return c.copier(toValue, fromValue, opt)
 }
 
-func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) {
+// Register TypedCopier
+func (c *copierData) Register(copiers ...TypedCopier) {
+	for _, co := range copiers {
+		for _, pair := range co.Pairs() {
+			c.typeCache.Add(pair, co)
+		}
+	}
+}
+
+func (c *copierData) HookFunc(hookFunc HookFunc) {
+	c.hookFunc = hookFunc
+}
+
+func (c copierData) copier(toValue interface{}, fromValue interface{}, opt Option) (err error) {
 	var (
 		isSlice bool
 		amount  = 1
@@ -66,7 +138,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 		fromType = reflect.TypeOf(from.Interface())
 	}
 
-	if toType.Kind() == reflect.Interface {
+	if toType.Kind() == reflect.Interface && to.Interface() != nil {
 		toType, _ = indirectType(reflect.TypeOf(to.Interface()))
 		oldTo := to
 		to = reflect.New(reflect.TypeOf(to.Interface())).Elem()
@@ -98,14 +170,14 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 
 		for _, k := range from.MapKeys() {
 			toKey := indirect(reflect.New(toType.Key()))
-			if !set(toKey, k, opt.DeepCopy) {
+			if !c.set(toKey, k, opt) {
 				return fmt.Errorf("%w map, old key: %v, new key: %v", ErrNotSupported, k.Type(), toType.Key())
 			}
 
 			elemType, _ := indirectType(toType.Elem())
 			toValue := indirect(reflect.New(elemType))
-			if !set(toValue, from.MapIndex(k), opt.DeepCopy) {
-				if err = copier(toValue.Addr().Interface(), from.MapIndex(k).Interface(), opt); err != nil {
+			if !c.set(toValue, from.MapIndex(k), opt) {
+				if err = c.copier(toValue.Addr().Interface(), from.MapIndex(k).Interface(), opt); err != nil {
 					return err
 				}
 			}
@@ -133,7 +205,7 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 				to.Set(reflect.Append(to, reflect.New(to.Type().Elem()).Elem()))
 			}
 
-			if !set(to.Index(i), from.Index(i), opt.DeepCopy) {
+			if !c.set(to.Index(i), from.Index(i), opt) {
 				err = CopyWithOption(to.Index(i).Addr().Interface(), from.Index(i).Interface(), opt)
 				if err != nil {
 					continue
@@ -180,9 +252,9 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 		}
 
 		// Get tag options
-		tagBitFlags := map[string]uint8{}
-		if dest.IsValid() {
-			tagBitFlags = getBitFlags(toType)
+		flags, err := getFlags(dest, source, toType, fromType)
+		if err != nil {
+			return err
 		}
 
 		// check source
@@ -193,17 +265,18 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 				name := field.Name
 
 				// Get bit flags for field
-				fieldFlags, _ := tagBitFlags[name]
+				fieldFlags, _ := flags.BitFlags[name]
 
 				// Check if we should ignore copying
 				if (fieldFlags & tagIgnore) != 0 {
 					continue
 				}
 
-				if fromField := source.FieldByName(name); fromField.IsValid() && !shouldIgnore(fromField, opt.IgnoreEmpty) {
+				srcFieldName, destFieldName := getFieldName(name, flags)
+				if fromField := source.FieldByName(srcFieldName); fromField.IsValid() && !shouldIgnore(fromField, opt.IgnoreEmpty) {
 					// process for nested anonymous field
 					destFieldNotSet := false
-					if f, ok := dest.Type().FieldByName(name); ok {
+					if f, ok := dest.Type().FieldByName(destFieldName); ok {
 						for idx := range f.Index {
 							destField := dest.FieldByIndex(f.Index[:idx+1])
 
@@ -229,26 +302,26 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 						break
 					}
 
-					toField := dest.FieldByName(name)
+					toField := dest.FieldByName(destFieldName)
 					if toField.IsValid() {
 						if toField.CanSet() {
-							if !set(toField, fromField, opt.DeepCopy) {
-								if err := copier(toField.Addr().Interface(), fromField.Interface(), opt); err != nil {
+							if !c.set(toField, fromField, opt) {
+								if err := c.copier(toField.Addr().Interface(), fromField.Interface(), opt); err != nil {
 									return err
 								}
 							}
 							if fieldFlags != 0 {
 								// Note that a copy was made
-								tagBitFlags[name] = fieldFlags | hasCopied
+								flags.BitFlags[name] = fieldFlags | hasCopied
 							}
 						}
 					} else {
 						// try to set to method
 						var toMethod reflect.Value
 						if dest.CanAddr() {
-							toMethod = dest.Addr().MethodByName(name)
+							toMethod = dest.Addr().MethodByName(destFieldName)
 						} else {
-							toMethod = dest.MethodByName(name)
+							toMethod = dest.MethodByName(destFieldName)
 						}
 
 						if toMethod.IsValid() && toMethod.Type().NumIn() == 1 && fromField.Type().AssignableTo(toMethod.Type().In(0)) {
@@ -261,19 +334,19 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 			// Copy from from method to dest field
 			for _, field := range deepFields(toType) {
 				name := field.Name
-
+				srcFieldName, destFieldName := getFieldName(name, flags)
 				var fromMethod reflect.Value
 				if source.CanAddr() {
-					fromMethod = source.Addr().MethodByName(name)
+					fromMethod = source.Addr().MethodByName(srcFieldName)
 				} else {
-					fromMethod = source.MethodByName(name)
+					fromMethod = source.MethodByName(srcFieldName)
 				}
 
 				if fromMethod.IsValid() && fromMethod.Type().NumIn() == 0 && fromMethod.Type().NumOut() == 1 && !shouldIgnore(fromMethod, opt.IgnoreEmpty) {
-					if toField := dest.FieldByName(name); toField.IsValid() && toField.CanSet() {
+					if toField := dest.FieldByName(destFieldName); toField.IsValid() && toField.CanSet() {
 						values := fromMethod.Call([]reflect.Value{})
 						if len(values) >= 1 {
-							set(toField, values[0], opt.DeepCopy)
+							c.set(toField, values[0], opt)
 						}
 					}
 				}
@@ -285,20 +358,20 @@ func copier(toValue interface{}, fromValue interface{}, opt Option) (err error) 
 				if to.Len() < i+1 {
 					to.Set(reflect.Append(to, dest.Addr()))
 				} else {
-					set(to.Index(i), dest.Addr(), opt.DeepCopy)
+					c.set(to.Index(i), dest.Addr(), opt)
 				}
 			} else if dest.Type().AssignableTo(to.Type().Elem()) {
 				if to.Len() < i+1 {
 					to.Set(reflect.Append(to, dest))
 				} else {
-					set(to.Index(i), dest, opt.DeepCopy)
+					c.set(to.Index(i), dest, opt)
 				}
 			}
 		} else if initDest {
 			to.Set(dest)
 		}
 
-		err = checkBitFlags(tagBitFlags)
+		err = checkBitFlags(flags.BitFlags)
 	}
 
 	return
@@ -346,7 +419,15 @@ func indirectType(reflectType reflect.Type) (_ reflect.Type, isPtr bool) {
 	return reflectType, isPtr
 }
 
-func set(to, from reflect.Value, deepCopy bool) bool {
+func (c copierData) set(to, from reflect.Value, opt Option) bool {
+	if from.IsValid() && from.IsValid() {
+		if ok, err := c.typedCopyFunc(to, from); err != nil {
+			return false
+		} else if ok {
+			return true
+		}
+	}
+
 	if from.IsValid() {
 		if to.Kind() == reflect.Ptr {
 			// set `to` to nil if from is nil
@@ -373,7 +454,7 @@ func set(to, from reflect.Value, deepCopy bool) bool {
 			to = to.Elem()
 		}
 
-		if deepCopy {
+		if opt.DeepCopy {
 			toKind := to.Kind()
 			if toKind == reflect.Interface && to.IsNil() {
 				to.Set(reflect.New(reflect.TypeOf(from.Interface())).Elem())
@@ -420,7 +501,7 @@ func set(to, from reflect.Value, deepCopy bool) bool {
 				to.Set(rv)
 			}
 		} else if from.Kind() == reflect.Ptr {
-			return set(to, from.Elem(), deepCopy)
+			return c.set(to, from.Elem(), opt)
 		} else {
 			return false
 		}
@@ -429,8 +510,27 @@ func set(to, from reflect.Value, deepCopy bool) bool {
 	return true
 }
 
+func (c copierData) typedCopyFunc(to, from reflect.Value) (copied bool, err error) {
+	if !c.hookFunc(to, from) {
+		return true, nil
+	}
+
+	pair := TypePair{
+		SrcType: from.Type(),
+		DstType: to.Type(),
+	}
+	if cpr, ok := c.typeCache.Get(pair); ok {
+		copier := cpr.(TypedCopier)
+		if err := copier.Copy(to, from); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
 // parseTags Parses struct tags and returns uint8 bit flags.
-func parseTags(tag string) (flags uint8) {
+func parseTags(tag string) (flags uint8, name string, err error) {
 	for _, t := range strings.Split(tag, ",") {
 		switch t {
 		case "-":
@@ -440,24 +540,68 @@ func parseTags(tag string) (flags uint8) {
 			flags = flags | tagMust
 		case "nopanic":
 			flags = flags | tagNoPanic
+		default:
+			if unicode.IsUpper([]rune(t)[0]) {
+				name = strings.TrimSpace(t)
+			} else {
+				err = errors.New("copier field name tag must be start Upper case")
+			}
 		}
 	}
 	return
 }
 
-// getBitFlags Parses struct tags for bit flags.
-func getBitFlags(toType reflect.Type) map[string]uint8 {
-	flags := map[string]uint8{}
-	toTypeFields := deepFields(toType)
+// getFlags Parses struct tags for bit flags.
+func getFlags(dest, src reflect.Value, toType, fromType reflect.Type) (Flags, error) {
+	flags := Flags{
+		BitFlags: map[string]uint8{},
+		SrcNames: TagNameMapping{
+			FieldNameToTag: map[string]string{},
+			TagToFieldName: map[string]string{},
+		},
+		DestNames: TagNameMapping{
+			FieldNameToTag: map[string]string{},
+			TagToFieldName: map[string]string{},
+		},
+	}
+	var toTypeFields, fromTypeFields []reflect.StructField
+	if dest.IsValid() {
+		toTypeFields = deepFields(toType)
+	}
+	if src.IsValid() {
+		fromTypeFields = deepFields(fromType)
+	}
 
 	// Get a list dest of tags
 	for _, field := range toTypeFields {
 		tags := field.Tag.Get("copier")
 		if tags != "" {
-			flags[field.Name] = parseTags(tags)
+			var name string
+			var err error
+			if flags.BitFlags[field.Name], name, err = parseTags(tags); err != nil {
+				return Flags{}, err
+			} else if name != "" {
+				flags.DestNames.FieldNameToTag[field.Name] = name
+				flags.DestNames.TagToFieldName[name] = field.Name
+			}
 		}
 	}
-	return flags
+
+	// Get a list source of tags
+	for _, field := range fromTypeFields {
+		tags := field.Tag.Get("copier")
+		if tags != "" {
+			var name string
+			var err error
+			if _, name, err = parseTags(tags); err != nil {
+				return Flags{}, err
+			} else if name != "" {
+				flags.SrcNames.FieldNameToTag[field.Name] = name
+				flags.SrcNames.TagToFieldName[name] = field.Name
+			}
+		}
+	}
+	return flags, nil
 }
 
 // checkBitFlags Checks flags for error or panic conditions.
@@ -485,5 +629,39 @@ func driverValuer(v reflect.Value) (i driver.Valuer, ok bool) {
 	}
 
 	i, ok = v.Addr().Interface().(driver.Valuer)
+	return
+}
+
+func getFieldName(fieldName string, flags Flags) (srcFieldName string, destFieldName string) {
+	// get dest field name
+	if srcTagName, ok := flags.SrcNames.FieldNameToTag[fieldName]; ok {
+		destFieldName = srcTagName
+		if destTagName, ok := flags.DestNames.TagToFieldName[srcTagName]; ok {
+			destFieldName = destTagName
+		}
+	} else {
+		if destTagName, ok := flags.DestNames.TagToFieldName[fieldName]; ok {
+			destFieldName = destTagName
+		}
+	}
+	if destFieldName == "" {
+		destFieldName = fieldName
+	}
+
+	// get source field name
+	if destTagName, ok := flags.DestNames.FieldNameToTag[fieldName]; ok {
+		srcFieldName = destTagName
+		if srcField, ok := flags.SrcNames.TagToFieldName[destTagName]; ok {
+			srcFieldName = srcField
+		}
+	} else {
+		if srcField, ok := flags.SrcNames.TagToFieldName[fieldName]; ok {
+			srcFieldName = srcField
+		}
+	}
+
+	if srcFieldName == "" {
+		srcFieldName = fieldName
+	}
 	return
 }

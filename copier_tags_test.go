@@ -3,7 +3,7 @@ package copier_test
 import (
 	"testing"
 
-	"github.com/jinzhu/copier"
+	"github.com/tomtwinkle/copier"
 )
 
 type EmployeeTags struct {
@@ -47,4 +47,39 @@ func TestCopyTagMust(t *testing.T) {
 		}
 	}()
 	copier.Copy(employee, user)
+}
+
+func TestCopyTagFieldName(t *testing.T) {
+	type SrcTags struct {
+		FieldA string
+		FieldB string `copier:"Field2"`
+		FieldC string `copier:"FieldTagMatch"`
+	}
+
+	type DestTags struct {
+		Field1 string `copier:"FieldA"`
+		Field2 string
+		Field3 string `copier:"FieldTagMatch"`
+	}
+
+	dst := &DestTags{}
+	src := &SrcTags{
+		FieldA: "FieldA->Field1",
+		FieldB: "FieldB->Field2",
+		FieldC: "FieldC->Field3",
+	}
+	err := copier.Copy(dst, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if dst.Field1 != src.FieldA {
+		t.Error("Field1 no copy")
+	}
+	if dst.Field2 != src.FieldB {
+		t.Error("Field2 no copy")
+	}
+	if dst.Field3 != src.FieldC {
+		t.Error("Field3 no copy")
+	}
 }
